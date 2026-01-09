@@ -48,7 +48,7 @@ class SegmentationValidator(DetectionValidator):
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.process = None
         self.args.task = "segment"
-        self.metrics = SegmentMetrics()
+        self.metrics = SegmentMetrics(compute_dice=self.args.mask_dice)
 
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Preprocess batch of images for YOLO segmentation validation.
@@ -77,7 +77,7 @@ class SegmentationValidator(DetectionValidator):
 
     def get_desc(self) -> str:
         """Return a formatted description of evaluation metrics."""
-        return ("%22s" + "%11s" * 10) % (
+        columns = [
             "Class",
             "Images",
             "Instances",
@@ -88,8 +88,12 @@ class SegmentationValidator(DetectionValidator):
             "Mask(P",
             "R",
             "mAP50",
-            "mAP50-95)",
-        )
+            "mAP50-95",
+            "mIoU" if self.args.mask_dice else "mIoU)",
+        ]
+        if self.args.mask_dice:
+            columns.append("Dice)")
+        return ("%22s" + "%11s" * (len(columns) - 1)) % tuple(columns)
 
     def postprocess(self, preds: list[torch.Tensor]) -> list[dict[str, torch.Tensor]]:
         """Post-process YOLO predictions and return output detections with proto.
@@ -170,6 +174,86 @@ class SegmentationValidator(DetectionValidator):
             tp_m = self.match_predictions(preds["cls"], gt_cls, iou).cpu().numpy()
         tp.update({"tp_m": tp_m})  # update tp with mask IoU
         return tp
+
+    def _mask_stats(
+        self, pred_masks: torch.Tensor, gt_masks: torch.Tensor, eps: float = 1e-7, compute_dice: bool = True
+    ) -> tuple[float, float]:
+        """Compute mIoU and Dice coefficient for union masks in an image."""
+        pred_empty = pred_masks.numel() == 0
+        gt_empty = gt_masks.numel() == 0
+        if pred_empty and gt_empty:
+            return 1.0, 1.0
+
+        if pred_empty:
+            pred_union = torch.zeros_like(gt_masks[0], dtype=torch.bool)
+        else:
+            pred_union = pred_masks > 0.5
+            if pred_union.ndim == 3:
+                pred_union = pred_union.any(0)
+
+        if gt_empty:
+            gt_union = torch.zeros_like(pred_union, dtype=torch.bool)
+        else:
+            gt_union = gt_masks > 0.5
+            if gt_union.ndim == 3:
+                gt_union = gt_union.any(0)
+
+        intersection = (pred_union & gt_union).sum().float()
+        pred_sum = pred_union.sum().float()
+        gt_sum = gt_union.sum().float()
+        if pred_sum == 0 and gt_sum == 0:
+            return 1.0, 1.0
+
+        mask_iou_value = mask_iou(gt_union.view(1, -1).float(), pred_union.view(1, -1).float(), eps=eps).item()
+        if compute_dice:
+            dice_value = (2 * intersection + eps) / (pred_sum + gt_sum + eps)
+            return float(mask_iou_value), float(dice_value.item())
+        return float(mask_iou_value), 0.0
+
+    def update_metrics(self, preds: list[dict[str, torch.Tensor]], batch: dict[str, Any]) -> None:
+        """Update metrics with new predictions and ground truth, including mask Dice/mIoU."""
+        for si, pred in enumerate(preds):
+            self.seen += 1
+            pbatch = self._prepare_batch(si, batch)
+            predn = self._prepare_pred(pred)
+
+            cls = pbatch["cls"].cpu().numpy()
+            no_pred = predn["cls"].shape[0] == 0
+            mask_iou_value, mask_dice_value = self._mask_stats(
+                predn["masks"], pbatch["masks"], compute_dice=self.args.mask_dice
+            )
+            self.metrics.update_stats(
+                {
+                    **self._process_batch(predn, pbatch),
+                    "target_cls": cls,
+                    "target_img": np.unique(cls),
+                    "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
+                    "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
+                    "mask_iou": np.array([mask_iou_value], dtype=np.float32),
+                    "mask_dice": np.array([mask_dice_value], dtype=np.float32),
+                }
+            )
+            # Evaluate
+            if self.args.plots:
+                self.confusion_matrix.process_batch(predn, pbatch, conf=self.args.conf)
+                if self.args.visualize:
+                    self.confusion_matrix.plot_matches(batch["img"][si], pbatch["im_file"], self.save_dir)
+
+            if no_pred:
+                continue
+
+            # Save
+            if self.args.save_json or self.args.save_txt:
+                predn_scaled = self.scale_preds(predn, pbatch)
+            if self.args.save_json:
+                self.pred_to_json(predn_scaled, pbatch)
+            if self.args.save_txt:
+                self.save_one_txt(
+                    predn_scaled,
+                    self.args.save_conf,
+                    pbatch["ori_shape"],
+                    self.save_dir / "labels" / f"{Path(pbatch['im_file']).stem}.txt",
+                )
 
     def plot_predictions(self, batch: dict[str, Any], preds: list[dict[str, torch.Tensor]], ni: int) -> None:
         """Plot batch predictions with masks and bounding boxes.
